@@ -28,8 +28,12 @@
 //! assert_eq!(p.1, 2);
 //! ```
 
-use std::marker::PhantomData;
+#![feature(coerce_unsized)]
+#![feature(unsize)]
+
 use std::cell::{Cell, RefCell};
+use std::marker::Unsize;
+use std::ops::CoerceUnsized;
 
 #[derive(Copy, Clone)]
 struct Node {
@@ -96,9 +100,9 @@ impl Pool {
         let lasthead = self.head.get();
         let nexthead = unsafe {lasthead.as_mut().unwrap().next};
         self.head.set(nexthead);
-        Pointer{
-            pool: self, node: lasthead, _phantom: Default::default()
-        }
+        unsafe {Pointer{
+            pool: self, node: std::mem::transmute(lasthead)
+        }}
     }
 
     fn extend(&self) {
@@ -128,22 +132,24 @@ impl Pool {
 /// A pointer to `T`, when dropped, the underlying memory
 /// would be recycled by the allocator.
 #[derive(Clone)]
-pub struct Pointer<'a, T> {
+pub struct Pointer<'a, T: ?Sized> {
     pool: &'a Pool,
-    node: *mut Node,
-    _phantom: PhantomData<T>,
+    node: *mut T,
 }
 
-impl<'a, T> Pointer<'a, T> {
+impl<'a, T, U> CoerceUnsized<Pointer<'a, T>> for Pointer<'a, U>
+    where U: Unsize<T> + ?Sized,
+          T: ?Sized,
+{ }
+
+impl<'a, T: ?Sized> Pointer<'a, T> {
     /// Borrow `ptr` as a reference.
     /// This is an associated function so that
     /// `T`'s methods won't be shadowed.
     #[inline]
     pub fn as_ref(ptr: &Self) -> &T {
-        debug_assert!(!ptr.node.is_null());
         unsafe {
-            let tptr: *mut T = std::mem::transmute(ptr.node);
-            tptr.as_ref().unwrap()
+            &*ptr.node
         }
     }
 
@@ -152,15 +158,26 @@ impl<'a, T> Pointer<'a, T> {
     /// `T`'s methods won't be shadowed.
     #[inline]
     pub fn as_mut(ptr: &mut Self) -> &mut T {
-        debug_assert!(!ptr.node.is_null());
         unsafe {
-            let tptr: *mut T = std::mem::transmute(ptr.node);
-            tptr.as_mut().unwrap()
+            &mut *ptr.node
         }
     }
+
+    // /// Borrow `ptr` as a mutable reference,
+    // /// return a typed erased pointer with it.
+    // ///
+    // /// This is useful when casting the `&mut T` to some trait objects
+    // #[inline]
+    // pub fn erase_borrow_mut(ptr: Self) -> (&'a mut T, Pointer<'a, ()>) {
+    //     debug_assert!(!ptr.node.is_null());
+    //     unsafe {
+    //         let tptr: *mut T = std::mem::transmute(ptr.node);
+    //         (tptr.as_mut().unwrap(), Pointer{pool: ptr.pool, node: ptr.node, _phantom: Default::default()})
+    //     }
+    // }
 }
 
-impl<'a, T> std::ops::Deref for Pointer<'a, T> {
+impl<'a, T:?Sized> std::ops::Deref for Pointer<'a, T> {
     type Target = T;
     #[inline]
     fn deref(&self) -> &T {
@@ -168,18 +185,21 @@ impl<'a, T> std::ops::Deref for Pointer<'a, T> {
     }
 }
 
-impl<'a, T> std::ops::DerefMut for Pointer<'a, T> {
+impl<'a, T:?Sized> std::ops::DerefMut for Pointer<'a, T> {
     #[inline]
     fn deref_mut(&mut self) -> &mut T {
         Pointer::as_mut(self)
     }
 }
 
-impl<'a, T> Drop for Pointer<'a, T> {
+impl<'a, T:?Sized> Drop for Pointer<'a, T> {
     fn drop(&mut self) {
-        unsafe {self.pool.recycle(self.node); }
+        unsafe {
+            let node: *mut Node = std::mem::transmute_copy(&self.node);
+            self.pool.recycle(node);
+        }
     }
-}
+}       
 
 /// Allows allocation
 pub struct Allocator {
@@ -284,6 +304,20 @@ mod tests {
         }
     }
 
+    trait Sum {
+        fn sum(&self) -> u64;
+    }
+
+    impl Sum for Byte15 {
+        fn sum(&self) -> u64 {
+            let mut ret = 0;
+            for i in self.val.iter() {
+                ret += *i as u64;
+            }
+            ret
+        }
+    }
+
     #[test]
     fn test_alloc_16() {
         let allocator = Allocator::new();
@@ -354,5 +388,29 @@ mod tests {
         let allocator = Allocator::new();
         let d: Pointer<Byte128> = allocator.alloc_default();
         assert_eq!(*d, Byte128::default());
+    }
+
+    #[test]
+    fn test_as_ref_mut() {
+        let allocator = Allocator::new();
+        let mut bytes1 = allocator.alloc(Byte15::new(1));
+        assert_eq!(bytes1.val[0], 1);
+        bytes1.val[1] = 2;
+        assert_eq!(bytes1.val[1], 2);
+    }
+
+    #[test]
+    fn test_unsize_coerce() {
+        let allocator = Allocator::new();
+        let bytes0 = allocator.alloc(Byte15::new(0));
+        {
+            let bytes1: Pointer<Sum> = allocator.alloc(Byte15::new(1));
+            assert_eq!(bytes1.sum(), 15);
+        }
+        let bytes2 = allocator.alloc(Byte15::new(2));
+        let bytes3 = allocator.alloc(Byte15::new(3));
+        assert_eq!(bytes0.sum(), 0);
+        assert_eq!(bytes2.sum(), 30);
+        assert_eq!(bytes3.sum(), 45);
     }
 }

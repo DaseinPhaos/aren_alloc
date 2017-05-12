@@ -25,6 +25,8 @@ assert_eq!(p.0, 1);
 assert_eq!(p.1, 2);
 ```
 
+As `CoerceUnsized` is supported for `Pointer`, compiling would require a nightly version.
+
 # License
 
 This project is distributed under the terms of both the MIT license and the Apache License (Version 2.0).
