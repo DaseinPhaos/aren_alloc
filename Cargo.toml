@@ -12,6 +12,6 @@ homepage = "https://github.com/DaseinPhaos/aren_alloc"
 readme = "README.md"
 
 keywords = ["memory-pool", "allocator"]
-categories = ["memory management"]
+categories = ["memory-management"]
 
 [dependencies]
