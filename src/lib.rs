@@ -6,204 +6,117 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-//! A memory allocator backed up by the concept of object pools,
-//! used to back up the memory allocation needs of `arendur`.
+//! A thread-local memory allocator backed up by the concept of object pools,
+//! used to address the memory allocation needs of `arendur`.
 //!
 //! This crate is useful when
 //!
 //! - you want to frequently create and destroy some objects
-//! - these objects are copyable small ones, under some 250 bytes
+//! - these objects are copyable small ones, with size under 256 bytes
 //! - you want the underlying memory to be reused
 //! - you want a unified interface for the pool, rather than a typed one
-
-#![feature(untagged_unions)]
+//!
+//! # Usage
+//!
+//! ```rust
+//! use aren_alloc::Allocator;
+//! #[derive(Copy, Clone)]
+//! struct Point(u32, u32);
+//! let allocator = Allocator::new();
+//! let p = allocator.alloc(Point(1, 2));
+//! assert_eq!(p.0, 1);
+//! assert_eq!(p.1, 2);
+//! ```
 
 use std::marker::PhantomData;
 use std::cell::{Cell, RefCell};
 
 #[derive(Copy, Clone)]
-struct Byte16 {
-    val: [u8; 16],
+struct Node {
+    next: *mut Node,
 }
 
-#[derive(Copy, Clone)]
-struct Byte32 {
-    val: [Byte16; 2],
-}
-
-#[derive(Copy, Clone)]
-struct Byte64 {
-    val: [Byte16; 4],
-}
-
-#[derive(Copy, Clone)]
-struct Byte128 {
-    val: [Byte16; 8],
-}
-
-#[derive(Copy, Clone)]
-struct Byte256 {
-    val: [Byte16; 16],
-}
-
-#[derive(Copy, Clone)]
-union Node16 {
-    val: Byte16,
-    next: *mut Node16,
-}
-
-trait Pool {
-    type Node;
-    unsafe fn recycle(&self, node: *mut Self::Node);
-}
-
-struct Pool16 {
-    pool: RefCell<Vec<Node16>>,
-    head: Cell<*mut Node16>,
-    // next: Option<Box<Pool16>>,
-}
-
-impl Pool16 {
-    fn new() -> Pool16 {
-        Pool16::with_capacity(4096/16)
-    }
-
-    fn with_capacity(num: usize) -> Pool16 {
-        assert!(num>0);
-        let mut pool: Vec<Node16> = Vec::with_capacity(num);
-        let head = unsafe {
-            let head = pool.as_mut_ptr();
-            for i in 0..num-1 {
-                let cur = head.offset(i as isize).as_mut().unwrap();
-                let next = head.offset((i+1) as isize);
-                cur.next = next;
-            }
-            head.offset((num-1) as isize).as_mut().unwrap().next = std::ptr::null_mut();
-            head
-        };
-        Pool16{
-            pool: RefCell::new(pool),
-            head: Cell::new(head),
-            // next: None,
-        }
-    }
-
-    // fn append_new_pool(&mut self) {
-    //     let cap = self.pool.capacity();
-    //     self.next = Some(Box::new(
-    //         Pool16::with_capacity(cap)
-    //     ));
-    // }
-
-    fn next_ptr<T>(&self) -> Option<PoolPtr<Pool16, Node16, T>> {
-        debug_assert!(std::mem::size_of::<T>() <= 16);
-        // if std::mem::size_of::<T>() <= 16 || self.head.get().is_null() {
-        if self.head.get().is_null() {
-            None
-        } else {
-            let lasthead = self.head.get();
-            let nexthead = unsafe {lasthead.as_mut().unwrap().next};
-            self.head.set(nexthead);
-            Some(PoolPtr{
-                pool: self, node: lasthead, _phantom: Default::default()
-            })
-        }
-    }
-}
-
-impl Pool for Pool16 {
-    type Node = Node16;
-    unsafe fn recycle(&self, node: *mut Node16) {
-        debug_assert!(!node.is_null());
-        let noderef = node.as_mut().unwrap();
-        noderef.next = self.head.get();
-        self.head.set(node);
-    }
-}
-
-struct PoolPtr<'a, P: 'a + Pool<Node=N>, N: 'a, T> {
-    pool: &'a P,
-    node: *mut N,
-    _phantom: PhantomData<T>,
-}
-
-impl<'a, P: 'a + Pool<Node=N>, N:'a, T> PoolPtr<'a, P, N, T> {
-    fn as_ref(&self) -> &T {unsafe {
-        let tptr: *mut T = std::mem::transmute(self.node);
-        tptr.as_ref().unwrap()
-    }}
-
-    fn as_mut(&mut self) -> &mut T {unsafe {
-        let tptr: *mut T = std::mem::transmute(self.node);
-        tptr.as_mut().unwrap()
-    }}
-}
-
-impl<'a, P, N, T> Drop for PoolPtr<'a, P, N, T>
-    where P: Pool<Node=N>,
-{
-    fn drop(&mut self) {unsafe {
-        self.pool.recycle(self.node);
-    }}
-}
-
-#[derive(Copy, Clone)]
-struct NodeB {
-    next: *mut NodeB,
-}
-
-struct PoolB {
+struct Pool {
     pool: RefCell<Vec<u8>>,
-    head: Cell<*mut NodeB>,
+    head: Cell<*mut Node>,
     ele_size: usize,
+    next_pool: RefCell<Option<Box<Pool>>>,
+    tail_pool: Cell<*mut Pool>,
 }
 
-impl PoolB {
-    fn new(ele_size: usize) -> PoolB {
-        debug_assert!(ele_size.is_power_of_two());
-        debug_assert!(ele_size<=4096);
-        PoolB::with_capacity(4096/ele_size, ele_size)
+const DEFAULT_POOL_SIZE: usize = 4096;
+
+impl Pool {
+    fn new(ele_size: usize) -> Box<Pool> {
+        debug_assert!(DEFAULT_POOL_SIZE%ele_size==0);
+        debug_assert!(ele_size<=DEFAULT_POOL_SIZE);
+        Pool::with_capacity(DEFAULT_POOL_SIZE/ele_size, ele_size)
     }
 
-    fn with_capacity(num: usize, ele_size: usize) -> PoolB {
+    fn with_capacity(num: usize, ele_size: usize) -> Box<Pool> {
         debug_assert!(num>0);
+        debug_assert!(ele_size>=std::mem::size_of::<Node>());
         debug_assert!(ele_size.is_power_of_two());
 
         let mut pool: Vec<u8> = Vec::with_capacity(num*ele_size);
-        let head = unsafe {
+        let head: *mut Node = unsafe {
             let head = pool.as_mut_ptr();
-            let head: *mut NodeB = std::mem::transmute(head);
             for i in 0..num-1 {
-                let cur = head.offset(i as isize).as_mut().unwrap();
-                let next = head.offset((i+1) as isize);
-                cur.next = next;
+                let cur = head.offset((i*ele_size) as isize).as_mut().unwrap();
+                let next = head.offset(((i+1)*ele_size) as isize);
+                let cur: *mut Node = std::mem::transmute(cur);
+                cur.as_mut().unwrap().next = std::mem::transmute(next);
             }
-            head.offset((num-1) as isize).as_mut().unwrap().next = std::ptr::null_mut();
-            head
+            let tail = head.offset(((num-1)*ele_size) as isize);
+            let tail: *mut Node = std::mem::transmute(tail);
+            tail.as_mut().unwrap().next = std::ptr::null_mut();
+            std::mem::transmute(head)
         };
-        PoolB{
+        
+        let mut p = Box::new(Pool{
             pool: RefCell::new(pool),
             head: Cell::new(head),
             ele_size: ele_size,
-        }
+            next_pool: RefCell::new(None),
+            tail_pool: Cell::new(std::ptr::null_mut()),
+        });
+        let pmut = <Box<_> as std::ops::DerefMut>::deref_mut(&mut p) as *mut Pool;
+        p.tail_pool.set(pmut);
+        p
     }
 
-    fn alloc<T>(&self) -> Option<Pointer<T>> {
+    fn alloc<T>(&self) -> Pointer<T> {
         debug_assert!(std::mem::size_of::<T>() <= self.ele_size);
+        debug_assert!(self.ele_size%std::mem::align_of::<T>() == 0);
         // if std::mem::size_of::<T>() <= 16 || self.head.get().is_null() {
         if self.head.get().is_null() {
-            None
-        } else {
-            let lasthead = self.head.get();
-            let nexthead = unsafe {lasthead.as_mut().unwrap().next};
-            self.head.set(nexthead);
-            Some(Pointer{
-                pool: self, node: lasthead, _phantom: Default::default()
-            })
+            self.extend();
+        }
+        debug_assert!(!self.head.get().is_null());
+        let lasthead = self.head.get();
+        let nexthead = unsafe {lasthead.as_mut().unwrap().next};
+        self.head.set(nexthead);
+        Pointer{
+            pool: self, node: lasthead, _phantom: Default::default()
         }
     }
 
-    unsafe fn recycle(&self, node: *mut NodeB) {
+    fn extend(&self) {
+        if self.head.get().is_null() { unsafe {
+            let tail = self.tail_pool.get().as_mut().unwrap();
+            debug_assert!(tail.next_pool.borrow().is_none());
+            let num = self.pool.borrow().capacity() / self.ele_size;
+            let mut next_pool = Pool::with_capacity(num, self.ele_size);
+            {
+                let newtail = <Box<_> as std::ops::DerefMut>::deref_mut(&mut next_pool);
+                self.head.set(newtail.head.get());
+                self.tail_pool.set(newtail);
+            }
+            *tail.next_pool.get_mut() = Some(next_pool);
+        }}
+    }
+
+    unsafe fn recycle(&self, node: *mut Node) {
         debug_assert!(!node.is_null());
         let oldhead = self.head.get();
         let noderef = node.as_mut().unwrap();
@@ -212,32 +125,234 @@ impl PoolB {
     }
 }
 
-struct Pointer<'a, T> {
-    pool: &'a PoolB,
-    node: *mut NodeB,
+/// A pointer to `T`, when dropped, the underlying memory
+/// would be recycled by the allocator.
+#[derive(Clone)]
+pub struct Pointer<'a, T> {
+    pool: &'a Pool,
+    node: *mut Node,
     _phantom: PhantomData<T>,
 }
 
 impl<'a, T> Pointer<'a, T> {
-    fn as_ref(&self) -> &T {
-        debug_assert!(!self.node.is_null());
+    /// Borrow `ptr` as a reference.
+    /// This is an associated function so that
+    /// `T`'s methods won't be shadowed.
+    #[inline]
+    pub fn as_ref(ptr: &Self) -> &T {
+        debug_assert!(!ptr.node.is_null());
         unsafe {
-            let tptr: *mut T = std::mem::transmute(self.node);
+            let tptr: *mut T = std::mem::transmute(ptr.node);
             tptr.as_ref().unwrap()
         }
     }
 
-    fn as_mut(&mut self) -> &mut T {
-        debug_assert!(!self.node.is_null());
+    /// Borrow `ptr` as a mutable reference.
+    /// This is an associated function so that
+    /// `T`'s methods won't be shadowed.
+    #[inline]
+    pub fn as_mut(ptr: &mut Self) -> &mut T {
+        debug_assert!(!ptr.node.is_null());
         unsafe {
-            let tptr: *mut T = std::mem::transmute(self.node);
+            let tptr: *mut T = std::mem::transmute(ptr.node);
             tptr.as_mut().unwrap()
         }
+    }
+}
+
+impl<'a, T> std::ops::Deref for Pointer<'a, T> {
+    type Target = T;
+    #[inline]
+    fn deref(&self) -> &T {
+        Pointer::as_ref(self)
+    }
+}
+
+impl<'a, T> std::ops::DerefMut for Pointer<'a, T> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut T {
+        Pointer::as_mut(self)
     }
 }
 
 impl<'a, T> Drop for Pointer<'a, T> {
     fn drop(&mut self) {
         unsafe {self.pool.recycle(self.node); }
+    }
+}
+
+/// Allows allocation
+pub struct Allocator {
+    pool16: Box<Pool>,
+    pool32: Box<Pool>,
+    pool64: Box<Pool>,
+    pool128: Box<Pool>,
+    pool256: Box<Pool>,
+}
+
+impl Allocator {
+    /// Construct a new allocator with default page capacity.
+    pub fn new() -> Allocator {
+        Allocator{
+            pool16: Pool::new(16),
+            pool32: Pool::new(32),
+            pool64: Pool::new(64),
+            pool128: Pool::new(128),
+            pool256: Pool::new(256),
+        }
+    }
+
+    /// Construct a new allocator with `cap`acity per inner page
+    pub fn with_capacity(cap: usize) -> Allocator {
+        Allocator{
+            pool16: Pool::with_capacity(cap, 16),
+            pool32: Pool::with_capacity(cap, 32),
+            pool64: Pool::with_capacity(cap, 64),
+            pool128: Pool::with_capacity(cap, 128),
+            pool256: Pool::with_capacity(cap, 256),
+        }
+    }
+
+    /// Allocate an instance of `T` with value `elem`,
+    /// return the allocated pointer.
+    /// `size_of::<T>()` should be le to 256 bytes.
+    #[inline]
+    pub fn alloc<T: Copy>(&self, elem: T) -> Pointer<T> {
+        let ele_size = std::mem::size_of::<T>();
+        let mut ret = if ele_size <= 16 {
+            self.pool16.alloc()
+        } else if ele_size <= 32 {
+            self.pool32.alloc()
+        } else if ele_size <= 64 {
+            self.pool64.alloc()
+        } else if ele_size <= 128 {
+            self.pool128.alloc()
+        } else if ele_size <= 256 {
+            self.pool256.alloc()
+        } else {
+            panic!("element size too big!");
+        };
+
+        *ret = elem;
+        ret
+    }
+
+    /// Allocate an instance of `T` with default value,
+    /// return the allocated pointer.
+    /// `size_of::<T>()` should be le to 256 bytes.
+    #[inline]
+    pub fn alloc_default<T: Copy+Default>(&self) -> Pointer<T> {
+        self.alloc(Default::default())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Copy, Clone, Eq, PartialEq, Debug)]
+    struct Byte128 {
+        val: [u64; 16]
+    }
+
+    impl Byte128 {
+        fn new(v: u64) -> Byte128 {
+            Byte128{ val: [v; 16] }
+        }
+    }
+
+    impl Default for Byte128 {
+        fn default() -> Byte128 {
+            Byte128::new(0)
+        }
+    }
+
+    #[derive(Copy, Clone, Eq, PartialEq, Debug)]
+    struct Byte15 {
+        val: [u8; 15]
+    }
+
+    impl Byte15 {
+        fn new(v: u8) -> Byte15 {
+            Byte15{ val: [v; 15] }
+        }
+    }
+
+    impl Default for Byte15 {
+        fn default() -> Byte15 {
+            Byte15::new(0)
+        }
+    }
+
+    #[test]
+    fn test_alloc_16() {
+        let allocator = Allocator::new();
+        let bytes1 = allocator.alloc(Byte15::new(1));
+        let bytes2 = allocator.alloc(Byte15::new(2));
+        let bytes3 = allocator.alloc(Byte15::new(3));
+        {
+            let bytes4 = allocator.alloc(Byte15::new(4));
+            assert_eq!(*bytes1, Byte15::new(1));
+            assert_eq!(*bytes2, Byte15::new(2));
+            assert_eq!(*bytes3, Byte15::new(3));
+            assert_eq!(*bytes4, Byte15::new(4));
+        }
+        assert_eq!(*bytes1, Byte15::new(1));
+        assert_eq!(*bytes2, Byte15::new(2));
+        assert_eq!(*bytes3, Byte15::new(3));
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_alloc_32_panic() {
+        let allocator = Pool::new(32);
+        let _bytes128: Pointer<Byte128> = allocator.alloc();
+    }
+
+    #[test]
+    fn test_alloc_128_addtional_pages() {
+        let allocator = Allocator::with_capacity(4);
+        let bytes1 = allocator.alloc(Byte128::new(1));
+        let bytes2 = allocator.alloc(Byte128::new(2));
+        let bytes3 = allocator.alloc(Byte128::new(3));
+        {
+            let bytes4 = allocator.alloc(Byte128::new(4));
+            let bytes5 = allocator.alloc(Byte128::new(5));
+            let bytes6 = allocator.alloc(Byte128::new(6));
+            let bytes7 = allocator.alloc(Byte128::new(7));
+            let bytes8 = allocator.alloc(Byte128::new(8));
+            let bytes9 = allocator.alloc(Byte128::new(9));
+            let bytes10 = allocator.alloc(Byte128::new(10));
+            assert_eq!(*bytes1, Byte128::new(1));
+            assert_eq!(*bytes2, Byte128::new(2));
+            assert_eq!(*bytes3, Byte128::new(3));
+            assert_eq!(*bytes4, Byte128::new(4));
+            assert_eq!(*bytes5, Byte128::new(5));
+            assert_eq!(*bytes6, Byte128::new(6));
+            assert_eq!(*bytes7, Byte128::new(7));
+            assert_eq!(*bytes8, Byte128::new(8));
+            assert_eq!(*bytes9, Byte128::new(9));
+            assert_eq!(*bytes10, Byte128::new(10));
+        }
+        let bytes6 = allocator.alloc(Byte128::new(6));
+        let bytes7 = allocator.alloc(Byte128::new(7));
+        let bytes8 = allocator.alloc(Byte128::new(8));
+        let bytes9 = allocator.alloc(Byte128::new(9));
+        let bytes10 = allocator.alloc(Byte128::new(10));
+        assert_eq!(*bytes1, Byte128::new(1));
+        assert_eq!(*bytes2, Byte128::new(2));
+        assert_eq!(*bytes3, Byte128::new(3));
+        assert_eq!(*bytes6, Byte128::new(6));
+        assert_eq!(*bytes7, Byte128::new(7));
+        assert_eq!(*bytes8, Byte128::new(8));
+        assert_eq!(*bytes9, Byte128::new(9));
+        assert_eq!(*bytes10, Byte128::new(10));
+    }
+
+    #[test]
+    fn test_alloc_default() {
+        let allocator = Allocator::new();
+        let d: Pointer<Byte128> = allocator.alloc_default();
+        assert_eq!(*d, Byte128::default());
     }
 }

@@ -1,6 +1,17 @@
 [package]
-name = "arenpool"
+name = "aren_alloc"
 version = "0.1.0"
-authors = ["Luxko <liarluxlux@gmail.com>"]
+authors = ["Luxko <luxko@qq.com>"]
+
+license = "MIT/Apache-2.0"
+description = "Simple allocator for small copyable objects inspired by object-pools."
+
+documentation = "https://docs.rs/aren_alloc"
+repository = "https://github.com/DaseinPhaos/aren_alloc"
+homepage = "https://github.com/DaseinPhaos/aren_alloc"
+readme = "README.md"
+
+keywords = ["memory pool", "allocator"]
+categories = ["memory management"]
 
 [dependencies]
