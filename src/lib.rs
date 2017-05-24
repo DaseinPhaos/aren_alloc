@@ -203,6 +203,7 @@ impl<'a, T:?Sized> Drop for Pointer<'a, T> {
 
 /// Allows allocation
 pub struct Allocator {
+    pool8: Box<Pool>,
     pool16: Box<Pool>,
     pool32: Box<Pool>,
     pool64: Box<Pool>,
@@ -214,6 +215,7 @@ impl Allocator {
     /// Construct a new allocator with default page capacity.
     pub fn new() -> Allocator {
         Allocator{
+            pool8: Pool::new(8),
             pool16: Pool::new(16),
             pool32: Pool::new(32),
             pool64: Pool::new(64),
@@ -225,6 +227,7 @@ impl Allocator {
     /// Construct a new allocator with `cap`acity per inner page
     pub fn with_capacity(cap: usize) -> Allocator {
         Allocator{
+            pool8: Pool::with_capacity(cap, 8),
             pool16: Pool::with_capacity(cap, 16),
             pool32: Pool::with_capacity(cap, 32),
             pool64: Pool::with_capacity(cap, 64),
@@ -239,7 +242,9 @@ impl Allocator {
     #[inline]
     pub fn alloc<T: Copy>(&self, elem: T) -> Pointer<T> {
         let ele_size = std::mem::size_of::<T>();
-        let mut ret = if ele_size <= 16 {
+        let mut ret = if ele_size <= 8 {
+            self.pool8.alloc()
+        } else if ele_size <= 16 {
             self.pool16.alloc()
         } else if ele_size <= 32 {
             self.pool32.alloc()
@@ -388,6 +393,8 @@ mod tests {
         let allocator = Allocator::new();
         let d: Pointer<Byte128> = allocator.alloc_default();
         assert_eq!(*d, Byte128::default());
+        let di: Pointer<i32> = allocator.alloc_default();
+        assert_eq!(*di, i32::default());
     }
 
     #[test]
