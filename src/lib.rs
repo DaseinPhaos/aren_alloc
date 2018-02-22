@@ -131,7 +131,6 @@ impl Pool {
 
 /// A pointer to `T`, when dropped, the underlying memory
 /// would be recycled by the allocator.
-#[derive(Clone)]
 pub struct Pointer<'a, T: ?Sized> {
     pool: &'a Pool,
     node: *mut T,

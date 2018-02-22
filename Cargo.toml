@@ -1,6 +1,6 @@
 [package]
 name = "aren_alloc"
-version = "0.2.1"
+version = "0.3.0"
 authors = ["Luxko <luxko@qq.com>"]
 
 license = "MIT/Apache-2.0"
